@@ -156,6 +156,10 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
                             _logger.LogTrace("{0}SQL notification timed out (this is expected every {1} seconds)", _tracePrefix, _dependencyTimeout.TotalSeconds);
                             break;
 
+                        case SqlNotificationType.Change when depResult.Source is SqlNotificationSource.Client && depResult.Info is SqlNotificationInfo.Error:
+                            await Task.Delay(2000, cancellationToken);
+                            break;
+
                         case SqlNotificationType.Change:
                             throw new InvalidOperationException($"Unexpected SQL notification Type={depResult.Type}, Source={depResult.Source}, Info={depResult.Info}");
 
