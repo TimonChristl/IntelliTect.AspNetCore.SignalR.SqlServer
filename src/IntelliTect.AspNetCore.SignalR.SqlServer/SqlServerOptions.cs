@@ -61,5 +61,15 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer
         /// Flag enum that specifies the allowed modes for retrieving messages from SQL Server. Default Auto.
         /// </summary>
         public SqlServerMessageMode Mode { get; set; } = SqlServerMessageMode.Auto;
+
+        /// <summary>
+        /// Custom service name to use, if not null.
+        /// </summary>
+        public string? CustomServiceName { get; set; }
+
+        /// <summary>
+        /// Custom queue name to use, if not null.
+        /// </summary>
+        public string? CustomQueueName { get; set; }
     }
 }

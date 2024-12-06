@@ -111,7 +111,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
                     var cancelReg = cancellationToken.Register((t) => ((TaskCompletionSource<SqlNotificationEventArgs>)t!).TrySetCanceled(), tcs);
                     var recordCount = await ReadRows(command =>
                     {
-                        var dependency = new SqlDependency(command, null, (int)_dependencyTimeout.TotalSeconds);
+                        var dependency = new SqlDependency(command, _options.CustomServiceName != null ? $"Service={_options.CustomServiceName}" : null, (int)_dependencyTimeout.TotalSeconds);
                         dependency.OnChange += (o, e) => tcs.SetResult(e);
                     });
 
@@ -352,7 +352,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
             _logger.LogTrace("{0}Starting SQL notification listener", _tracePrefix);
             try
             {
-                if (SqlDependency.Start(_options.ConnectionString))
+                if (SqlDependency.Start(_options.ConnectionString, _options.CustomQueueName))
                 {
                     _logger.LogTrace("{0}SQL notification listener started", _tracePrefix);
                 }
