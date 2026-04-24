@@ -32,6 +32,54 @@ ALTER DATABASE [DatabaseName] SET ENABLE_BROKER WITH ROLLBACK IMMEDIATE
 
 You can also set `AutoEnableServiceBroker = true` when configuring in your `Startup.cs`, but this requires that the application have permissions to do so and has the same caveats that there can be no other active database sessions.
 
+## SQL Server Permissions
+
+By default, the library will automatically create its required schema and tables on startup (`AutoInstallSchema = true`). If you allow this, the SQL login used by your application will need elevated permissions to perform DDL operations. Alternatively, you can pre-install the schema using the [`install.sql`](./src/IntelliTect.AspNetCore.SignalR.SqlServer/Internal/SqlServer/install.sql) script and then configure `AutoInstallSchema = false` to run with minimal permissions.
+
+### Minimal Runtime Permissions (Recommended for Production)
+
+If you pre-install the database schema and set `AutoInstallSchema = false`, the application only needs the following permissions. Replace `SignalR` with your configured schema name and `YourHubName` with your hub's table name. Repeat for each table index from `0` to `TableCount - 1` (e.g. with the default `TableCount = 1`, you would have `Messages_YourHubName_0` and `Messages_YourHubName_0_Id`):
+
+``` sql
+-- Permissions on message tables (repeat for each table index from 0 to TableCount - 1):
+GRANT SELECT, INSERT, DELETE ON [SignalR].[Messages_YourHubName_0] TO [YourUser];
+GRANT SELECT, UPDATE ON [SignalR].[Messages_YourHubName_0_Id] TO [YourUser];
+```
+
+If Service Broker is enabled and you want to use it for real-time notifications (instead of falling back to polling), additional permissions are required:
+
+``` sql
+-- Required for SqlDependency to subscribe to query notifications:
+GRANT SUBSCRIBE QUERY NOTIFICATIONS TO [YourUser];
+
+-- Required for SqlDependency to create its temporary Service Broker objects:
+GRANT CREATE PROCEDURE TO [YourUser];
+GRANT CREATE QUEUE TO [YourUser];
+GRANT CREATE SERVICE TO [YourUser];
+GRANT REFERENCES ON CONTRACT::[http://schemas.microsoft.com/SQL/Notifications/PostQueryNotification] TO [YourUser];
+
+-- Required for receiving Service Broker error notifications:
+GRANT RECEIVE ON QueryNotificationErrorsQueue TO [YourUser];
+```
+
+### Schema Installation Permissions
+
+If using the default `AutoInstallSchema = true`, the login needs permissions to create the schema and tables. The simplest but broadest approach is to grant the `db_ddladmin` and `db_datawriter` database roles. For more restricted access, grant only the specific permissions needed:
+
+``` sql
+GRANT CREATE SCHEMA TO [YourUser];
+GRANT CREATE TABLE TO [YourUser];
+GRANT ALTER ON SCHEMA::[SignalR] TO [YourUser];
+GRANT INSERT ON SCHEMA::[SignalR] TO [YourUser];
+GRANT SELECT ON SCHEMA::[SignalR] TO [YourUser];
+```
+
+If also using `AutoEnableServiceBroker = true`, the login needs `ALTER` permission on the database:
+
+``` sql
+GRANT ALTER ON DATABASE::[YourDatabase] TO [YourUser];
+```
+
 ## Usage
 
 1. Install the `IntelliTect.AspNetCore.SignalR.SqlServer` NuGet package.
