@@ -46,16 +46,23 @@ GRANT SELECT, INSERT, DELETE ON [SignalR].[Messages_YourHubName_0] TO [YourUser]
 GRANT SELECT, UPDATE ON [SignalR].[Messages_YourHubName_0_Id] TO [YourUser];
 ```
 
-If Service Broker is enabled and you want to use it for real-time notifications (instead of falling back to polling), additional permissions are required:
+If Service Broker is enabled and you want to use it for real-time notifications (instead of falling back to polling), the `SqlDependency` mechanism requires additional permissions to create and manage its temporary Service Broker objects. The simplest approach is to grant the `db_owner` role:
+
+``` sql
+EXEC sp_addrolemember 'db_owner', 'YourUser';
+```
+
+If `db_owner` is too broad, the following individual permissions are required at a minimum, though `SqlDependency` may still require `db_owner` in some environments:
 
 ``` sql
 -- Required for SqlDependency to subscribe to query notifications:
 GRANT SUBSCRIBE QUERY NOTIFICATIONS TO [YourUser];
 
--- Required for SqlDependency to create its temporary Service Broker objects:
+-- Required for SqlDependency to create and manage its temporary Service Broker objects in the dbo schema:
 GRANT CREATE PROCEDURE TO [YourUser];
 GRANT CREATE QUEUE TO [YourUser];
 GRANT CREATE SERVICE TO [YourUser];
+GRANT CONTROL ON SCHEMA::dbo TO [YourUser];
 GRANT REFERENCES ON CONTRACT::[http://schemas.microsoft.com/SQL/Notifications/PostQueryNotification] TO [YourUser];
 
 -- Required for receiving Service Broker error notifications:
