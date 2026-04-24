@@ -3,6 +3,7 @@
 	<PropertyGroup>
 		<TargetFrameworks>net8.0;net9.0</TargetFrameworks>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
 
 		<!-- Sourcelink: -->
 		<PublishRepositoryUrl>true</PublishRepositoryUrl>
@@ -24,6 +25,10 @@
 	
 	<ItemGroup>
 		<EmbeddedResource Include="**/*.sql" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Include="../../README.md" Pack="true" PackagePath="/" />
 	</ItemGroup>
 
 </Project>
