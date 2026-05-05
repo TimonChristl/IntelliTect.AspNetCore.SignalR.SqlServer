@@ -16,7 +16,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Tests
     {
         private const string databaseName = "SignalRUnitTestsDb";
         private const string connectionString = 
-            "Server=localhost;Database=" + databaseName + ";Trusted_Connection=True;Timeout=5";
+            "Server=localhost;Database=" + databaseName + ";Trusted_Connection=True;Timeout=5;TrustServerCertificate=True";
 
         [SkippableFact]
         public async Task CanSendAndReceivePayloads_WithServiceBroker()
@@ -63,8 +63,8 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Tests
             };
 
             var prefix = nameof(CanSendAndReceivePayloads_WithServiceBroker_UnderHeavyLoad);
-            var installer = new SqlInstaller(options, NullLogger.Instance, prefix);
-            var receiver = new SqlReceiver(options, NullLogger.Instance, prefix + "_0", "");
+            var installer = new SqlInstaller(options, NullLogger.Instance, prefix, prefix);
+            var receiver = new SqlReceiver(options, NullLogger.Instance, prefix + "_0", "TestHub");
 
             var receivedMessages = new ConcurrentBag<byte[]>();
             await installer.Install();
@@ -83,7 +83,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Tests
             // the hub to be sending messages.
             int numSenders = 100;
             int numSent = 0;
-            var sender = new SqlSender(options, NullLogger.Instance, prefix + "_0");
+            var sender = new SqlSender(options, NullLogger.Instance, prefix + "_0", "TestHub");
             for (int i = 0; i < numSenders; i++)
             {
                 _ = Task.Run(async () =>
@@ -115,9 +115,9 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Tests
 
         private async Task RunCore(SqlServerOptions options, string prefix)
         {
-            var installer = new SqlInstaller(options, NullLogger.Instance, prefix);
-            var sender = new SqlSender(options, NullLogger.Instance, prefix + "_0");
-            var receiver = new SqlReceiver(options, NullLogger.Instance, prefix + "_0", "");
+            var installer = new SqlInstaller(options, NullLogger.Instance, prefix, prefix);
+            var sender = new SqlSender(options, NullLogger.Instance, prefix + "_0", "TestHub");
+            var receiver = new SqlReceiver(options, NullLogger.Instance, prefix + "_0", "TestHub");
 
             var receivedMessages = new ConcurrentBag<byte[]>();
             var receivedEvent = new SemaphoreSlim(0);

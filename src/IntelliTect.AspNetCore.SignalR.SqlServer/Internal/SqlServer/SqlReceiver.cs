@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.Metrics;
 using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
@@ -42,6 +43,23 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
         private bool _disposed;
         private readonly string _maxIdSql = "SELECT [PayloadId] FROM [{0}].[{1}_Id]";
         private readonly string _selectSql = "SELECT [PayloadId], [Payload], [InsertedOn] FROM [{0}].[{1}] WHERE [PayloadId] > @PayloadId";
+        private readonly TimeSpan _activityMaxDuration = TimeSpan.FromMinutes(10);
+        
+        private static readonly Histogram<double> _pollDelayHistogram = SqlServerOptions.Meter.CreateHistogram<double>(
+            "signalr.sqlserver.poll_delay",
+            "ms",
+            "Distribution of polling delay intervals showing backoff patterns");
+            
+        private static readonly Counter<long> _rowsReadCounter = SqlServerOptions.Meter.CreateCounter<long>(
+            "signalr.sqlserver.rows_read_total",
+            "rows",
+            "Total number of message rows read from SQL Server");
+            
+        private static readonly Histogram<double> _queryDurationHistogram = SqlServerOptions.Meter.CreateHistogram<double>(
+            "signalr.sqlserver.query_duration",
+            "ms",
+            "Duration of SQL Server query execution for reading messages");
+            
 
         public SqlReceiver(SqlServerOptions options, ILogger logger, string tableName, string tracePrefix)
         {
@@ -73,14 +91,26 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
         {
             if (_cts.IsCancellationRequested) return;
 
-            if (!_lastPayloadId.HasValue)
+            bool useBroker = _options.Mode.HasFlag(SqlServerMessageMode.ServiceBroker);
+
+            using (var activity = SqlServerOptions.ActivitySource.StartActivity("SignalR.SqlServer.Start"))
             {
-                _lastPayloadId = await GetLastPayloadId();
+                activity?.SetTag("signalr.hub", _tracePrefix);
+                activity?.SetTag("signalr.sql.mode", _options.Mode.ToString());
+
+                if (!_lastPayloadId.HasValue)
+                {
+                    _lastPayloadId = await GetLastPayloadId();
+                }
+                if (useBroker)
+                {
+                    useBroker = StartSqlDependencyListener();
+                }
             }
 
             if (_cts.IsCancellationRequested) return;
 
-            if (_options.Mode.HasFlag(SqlServerMessageMode.ServiceBroker) && StartSqlDependencyListener())
+            if (useBroker)
             {
                 await NotificationLoop(_cts.Token);
             }
@@ -103,9 +133,12 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
             {
                 if (cancellationToken.IsCancellationRequested) return;
 
+                using var activity = SqlServerOptions.ActivitySource.StartActivity("SignalR.SqlServer.Listen");
+                activity?.SetTag("signalr.hub", _tracePrefix);
+
                 try
                 {
-                    _logger.LogDebug("{0}Setting up SQL notification", _tracePrefix);
+                    _logger.LogDebug("{HubStream}: Setting up SQL notification", _tracePrefix);
 
                     var tcs = new TaskCompletionSource<SqlNotificationEventArgs>();
                     var cancelReg = cancellationToken.Register((t) => ((TaskCompletionSource<SqlNotificationEventArgs>)t!).TrySetCanceled(), tcs);
@@ -124,11 +157,11 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
                             recordCount = await ReadRows(null);
                         }
 
-                        _logger.LogDebug("{0}Records were returned by the command that sets up the SQL notification, restarting the receive loop", _tracePrefix);
+                        _logger.LogDebug("{HubStream}: Records were returned by the command that sets up the SQL notification, restarting the receive loop", _tracePrefix);
                         continue;
                     }
 
-                    _logger.LogTrace("{0}No records received while setting up SQL notification", _tracePrefix);
+                    _logger.LogTrace("{HubStream}: No records received while setting up SQL notification", _tracePrefix);
 
                     var depResult = await tcs.Task;
                     cancelReg.Dispose();
@@ -140,7 +173,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
                         case SqlNotificationType.Change when depResult.Info is SqlNotificationInfo.Update:
                             // Typically means new records are available. (TODO: verify this?).
                             // Loop again to pick them up by performing another query.
-                            _logger.LogTrace("{0}SQL notification details: Type={1}, Source={2}, Info={3}", _tracePrefix, depResult.Type, depResult.Source, depResult.Info);
+                            _logger.LogTrace("{HubStream}: SQL notification details: Type={1}, Source={2}, Info={3}", _tracePrefix, depResult.Type, depResult.Source, depResult.Info);
 
                             // Read rows immediately, since on the next loop we know for certain there will be rows.
                             // There's no point doing a full loop that includes setting up a SqlDependency that
@@ -153,7 +186,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
 
                         case SqlNotificationType.Change when depResult.Source is SqlNotificationSource.Timeout:
                             // Expected while there is no activity. We put a timeout on our SqlDependency so they're not running infinitely.
-                            _logger.LogTrace("{0}SQL notification timed out (this is expected every {1} seconds)", _tracePrefix, _dependencyTimeout.TotalSeconds);
+                            _logger.LogTrace("{HubStream}: SQL notification timed out (this is expected every {1} seconds)", _tracePrefix, _dependencyTimeout.TotalSeconds);
                             break;
 
                         case SqlNotificationType.Change when depResult.Source is SqlNotificationSource.Client && depResult.Info is SqlNotificationInfo.Error:
@@ -164,7 +197,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
                             throw new InvalidOperationException($"Unexpected SQL notification Type={depResult.Type}, Source={depResult.Source}, Info={depResult.Info}");
 
                         case SqlNotificationType.Subscribe:
-                            _logger.LogError("{0}SQL notification subscription error: Type={1}, Source={2}, Info={3}", _tracePrefix, depResult.Type, depResult.Source, depResult.Info);
+                            _logger.LogError("{HubStream}: SQL notification subscription error: Type={1}, Source={2}, Info={3}", _tracePrefix, depResult.Type, depResult.Source, depResult.Info);
 
                             if (depResult.Info == SqlNotificationInfo.TemplateLimit)
                             {
@@ -174,6 +207,9 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
                             else
                             {
                                 // Unknown subscription error, let's stop using query notifications
+                                activity?.SetStatus(ActivityStatusCode.Error);
+                                // Dispose so this activity doesn't become the parent of the next loop.
+                                activity?.Dispose();
                                 _notificationsDisabled = true;
                                 await StartLoop();
                                 return;
@@ -184,14 +220,15 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
                 catch (TaskCanceledException) { return; }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "{0}Error in SQL notification loop", _tracePrefix);
+                    activity?.SetStatus(ActivityStatusCode.Error);
+                    _logger.LogError(ex, "{HubStream}: Error in SQL notification loop", _tracePrefix);
 
                     await Task.Delay(1000, cancellationToken);
                     continue;
                 }
             }
 
-            _logger.LogDebug("{0}SQL notification loop fell out", _tracePrefix);
+            _logger.LogDebug("{HubStream}: SQL notification loop fell out", _tracePrefix);
             await StartLoop();
         }
 
@@ -200,58 +237,80 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
         /// </summary>
         private async Task PollingLoop(CancellationToken cancellationToken)
         {
-            var delays = _updateLoopRetryDelays;
-            for (var retrySetIndex = 0; retrySetIndex < delays.Length; retrySetIndex++)
+            var activity = SqlServerOptions.ActivitySource.StartActivity("SignalR.SqlServer.Poll");
+            activity?.SetTag("signalr.hub", _tracePrefix);
+
+            try
             {
-                Tuple<int, int> retry = delays[retrySetIndex];
-                var retryDelay = retry.Item1;
-                var numRetries = retry.Item2;
-
-                for (var retryIndex = 0; retryIndex < numRetries; retryIndex++)
+                var delays = _updateLoopRetryDelays;
+                for (var retrySetIndex = 0; retrySetIndex < delays.Length; retrySetIndex++)
                 {
-                    if (cancellationToken.IsCancellationRequested) return;
+                    Tuple<int, int> retry = delays[retrySetIndex];
+                    var retryDelay = retry.Item1;
+                    var numRetries = retry.Item2;
 
-                    var recordCount = 0;
-                    try
+                    for (var retryIndex = 0; retryIndex < numRetries; retryIndex++)
                     {
-                        if (retryDelay > 0)
-                        {
-                            _logger.LogTrace("{0}Waiting {1}ms before checking for messages again", _tracePrefix, retryDelay);
+                        if (cancellationToken.IsCancellationRequested) return;
 
-                            await Task.Delay(retryDelay, cancellationToken);
+                        // Restart activity every 10 minutes to prevent long-running activities
+                        if (activity != null && DateTime.UtcNow - activity.StartTimeUtc > _activityMaxDuration)
+                        {
+                            activity?.Dispose();
+                            activity = SqlServerOptions.ActivitySource.StartActivity("SignalR.SqlServer.Poll");
+                            activity?.SetTag("signalr.hub", _tracePrefix);
                         }
 
-                        recordCount = await ReadRows(null);
-                    }
-                    catch (TaskCanceledException) { return; }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "{0}Error in SQL polling loop", _tracePrefix);
-                    }
+                        var recordCount = 0;
+                        try
+                        {
+                            if (retryDelay > 0)
+                            {
+                                _logger.LogTrace("{HubStream}: Waiting {Delay}ms before checking for messages again", _tracePrefix, retryDelay);
 
-                    if (recordCount > 0)
-                    {
-                        _logger.LogDebug("{0}{1} records received", _tracePrefix, recordCount);
+                                await Task.Delay(retryDelay, cancellationToken);
+                            }
 
-                        // We got records so start the retry loop again
-                        // at the lowest delay.
-                        retrySetIndex = -1;
-                        break;
-                    }
+                            recordCount = await ReadRows(null);
+                            
+                            // Record polling delay distribution to show backoff patterns
+                            _pollDelayHistogram.Record(retryDelay, 
+                                new KeyValuePair<string, object?>("signalr.hub", _tracePrefix));
+                        }
+                        catch (TaskCanceledException) { return; }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "{HubStream}: Error in SQL polling loop", _tracePrefix);
+                        }
 
-                    _logger.LogTrace("{0}No records received", _tracePrefix);
+                        if (recordCount > 0)
+                        {
+                            _logger.LogDebug("{HubStream}: {RecordCount} records received", _tracePrefix, recordCount);
 
-                    var isLastRetry = retrySetIndex == delays.Length - 1 && retryIndex == numRetries - 1;
+                            // We got records so start the retry loop again
+                            // at the lowest delay.
+                            retrySetIndex = -1;
+                            break;
+                        }
 
-                    if (isLastRetry)
-                    {
-                        // Last retry loop so just stay looping on the last retry delay
-                        retryIndex--;
+                        _logger.LogTrace("{HubStream}: No records received", _tracePrefix);
+
+                        var isLastRetry = retrySetIndex == delays.Length - 1 && retryIndex == numRetries - 1;
+
+                        if (isLastRetry)
+                        {
+                            // Last retry loop so just stay looping on the last retry delay
+                            retryIndex--;
+                        }
                     }
                 }
             }
+            finally
+            {
+                activity?.Dispose();
+            }
 
-            _logger.LogDebug("{0}SQL polling loop fell out", _tracePrefix);
+            _logger.LogDebug("{HubStream}: SQL polling loop fell out", _tracePrefix);
             await StartLoop();
         }
 
@@ -276,7 +335,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "{0}SqlReceiver error starting", _tracePrefix);
+                _logger.LogError(ex, "{HubStream}: SqlReceiver error starting", _tracePrefix);
                 throw;
             }
         }
@@ -300,6 +359,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
             beforeExecute?.Invoke(command);
 
             // Fetch any rows that might already be available after the last PayloadId.
+            var start = DateTime.UtcNow;
             var reader = await command.ExecuteReaderAsync();
             var recordCount = 0;
 
@@ -307,6 +367,18 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
             {
                 recordCount++;
                 await ProcessRecord(reader);
+            }
+
+            // Record query duration and rows read metrics
+            if (_queryDurationHistogram.Enabled)
+            {
+                _queryDurationHistogram.Record((DateTime.UtcNow - start).TotalMilliseconds, 
+                    new KeyValuePair<string, object?>("signalr.hub", _tracePrefix));
+            }
+                
+            if (recordCount > 0 && _rowsReadCounter.Enabled)
+            {
+                _rowsReadCounter.Add(recordCount, new KeyValuePair<string, object?>("signalr.hub", _tracePrefix));
             }
 
             return recordCount;
@@ -321,22 +393,22 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
             var id = record.GetInt64(0);
             var payload = ((SqlDataReader)record).GetSqlBinary(1);
 
-            _logger.LogTrace("{0}SqlReceiver last payload ID={1}, new payload ID={2}", _tracePrefix, _lastPayloadId, id);
+            _logger.LogTrace("{HubStream}: SqlReceiver last payload ID={1}, new payload ID={2}", _tracePrefix, _lastPayloadId, id);
 
             if (id > _lastPayloadId + 1)
             {
-                _logger.LogError("{0}Missed message(s) from SQL Server. Expected payload ID {1} but got {2}.", _tracePrefix, _lastPayloadId + 1, id);
+                _logger.LogError("{HubStream}: Missed message(s) from SQL Server. Expected payload ID {1} but got {2}.", _tracePrefix, _lastPayloadId + 1, id);
             }
             else if (id <= _lastPayloadId)
             {
-                _logger.LogInformation("{0}Duplicate message(s) or payload ID reset from SQL Server. Last payload ID {1}, this payload ID {2}", _tracePrefix, _lastPayloadId, id);
+                _logger.LogInformation("{HubStream}: Duplicate message(s) or payload ID reset from SQL Server. Last payload ID {1}, this payload ID {2}", _tracePrefix, _lastPayloadId, id);
             }
 
             _lastPayloadId = id;
 
-            _logger.LogTrace("{0}Updated receive reader initial payload ID parameter={1}", _tracePrefix, _lastPayloadId);
+            _logger.LogTrace("{HubStream}: Updated receive reader initial payload ID parameter={1}", _tracePrefix, _lastPayloadId);
 
-            _logger.LogTrace("{0}Payload {1} received", _tracePrefix, id);
+            _logger.LogTrace("{HubStream}: Payload {1} received", _tracePrefix, id);
 
             await _onReceived!.Invoke(id, (byte[]?)payload ?? Array.Empty<byte>());
         }
@@ -353,22 +425,22 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
                 return false;
             }
 
-            _logger.LogTrace("{0}Starting SQL notification listener", _tracePrefix);
+            _logger.LogTrace("{HubStream}: Starting SQL notification listener", _tracePrefix);
             try
             {
                 if (SqlDependency.Start(_options.ConnectionString, _options.CustomQueueName))
                 {
-                    _logger.LogTrace("{0}SQL notification listener started", _tracePrefix);
+                    _logger.LogTrace("{HubStream}: SQL notification listener started", _tracePrefix);
                 }
                 else
                 {
-                    _logger.LogTrace("{0}SQL notification listener was already running", _tracePrefix);
+                    _logger.LogTrace("{HubStream}: SQL notification listener was already running", _tracePrefix);
                 }
                 return true;
             }
             catch (InvalidOperationException)
             {
-                _logger.LogWarning("{0}SQL Service Broker is disabled on the target database.", _tracePrefix);
+                _logger.LogWarning("{HubStream}: SQL Service Broker is disabled on the target database.", _tracePrefix);
                 _notificationsDisabled = true;
                 return false;
             }
@@ -376,7 +448,7 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
             {
                 // Workaround for https://github.com/dotnet/SqlClient/issues/1264
 
-                _logger.LogWarning("{0}SQL Service Broker is disabled or unsupported by the target database.", _tracePrefix);
+                _logger.LogWarning("{HubStream}: SQL Service Broker is disabled or unsupported by the target database.", _tracePrefix);
                 _notificationsDisabled = true;
                 return false;
             }
@@ -386,13 +458,13 @@ namespace IntelliTect.AspNetCore.SignalR.SqlServer.Internal
                 // Specifically that Azure SQL Database reports that service broker is enabled,
                 // even though it is entirely unsupported.
 
-                _logger.LogWarning("{0}SQL Service Broker is unsupported by the target database.", _tracePrefix);
+                _logger.LogWarning("{HubStream}: SQL Service Broker is unsupported by the target database.", _tracePrefix);
                 _notificationsDisabled = true;
                 return false;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "{0}Error starting SQL notification listener", _tracePrefix);
+                _logger.LogError(ex, "{HubStream}: Error starting SQL notification listener", _tracePrefix);
 
                 return false;
             }
